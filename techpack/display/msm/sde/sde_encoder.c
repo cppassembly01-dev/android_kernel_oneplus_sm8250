@@ -7230,6 +7230,7 @@ void sde_encoder_adfr_aod_fod_source_switch(void *dsi_display, int te_source)
 }
 #endif
 
+
 void sde_encoder_trigger_early_wakeup(struct drm_encoder *drm_enc)
 {
 	struct sde_encoder_virt *sde_enc = NULL;
