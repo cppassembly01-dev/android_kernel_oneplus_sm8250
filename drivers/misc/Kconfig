@@ -690,3 +690,11 @@ config OKL4_LINK_SHBUF
 	      transport. This driver presents the link to Linux as a character device
 	      which can be written to or read from to access the shared memory. An ioctl
 	      on the device is used to send a virtual interrupt to the partner cell.
+
+config NTSYNC
+	tristate "NT synchronization primitive emulation"
+	help
+	  This module provides support for emulating Windows NT synchronization
+	  primitives. It is intended to be used by Wine or emulator-like software.
+
+	  If unsure, say N.
