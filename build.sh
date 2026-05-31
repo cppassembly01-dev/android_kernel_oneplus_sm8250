@@ -6,7 +6,7 @@ export CLANG=/home/akronnos/toolchains/android-ndk-r29/toolchains/llvm/prebuilt/
 export PATH=$CLANG:$PATH
 
 rm -rf out
-make O=out vendor/kona-perf_defconfig vendor/oplus.config vendor/droispaces.config vendor/linux.config vendor/nethunter.config
+make O=out vendor/kona-perf_defconfig vendor/oplus.config vendor/droidspaces.config vendor/linux.config vendor/nethunter.config
 sed -i 's/# CONFIG_KSU_SUSFS is not set/CONFIG_KSU_SUSFS=y/g' out/.config
 sed -i 's/# CONFIG_KPM is not set/CONFIG_KPM=y/g' out/.config
 sed -i 's/# CONFIG_NTSYNC is not set/CONFIG_NTSYNC=y/g' out/.config
