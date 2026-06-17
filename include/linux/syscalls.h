@@ -398,6 +398,26 @@ asmlinkage long sys_mount(char __user *dev_name, char __user *dir_name,
 asmlinkage long sys_pivot_root(const char __user *new_root,
 				const char __user *put_old);
 
+/* fs/namespace.c - new mount API (backported from 5.2+) */
+asmlinkage long sys_open_tree(int dfd, const char __user *path,
+			      unsigned int flags);
+asmlinkage long sys_move_mount(int from_dfd, const char __user *from_path,
+			       int to_dfd, const char __user *to_path,
+			       unsigned int ms_flags);
+asmlinkage long sys_mount_setattr(int dfd, const char __user *path,
+				  unsigned int flags,
+				  struct mount_attr __user *uattr,
+				  size_t usize);
+
+/* fs/fsopen.c - new mount API (backported from 5.2) */
+asmlinkage long sys_fsopen(const char __user *fs_name, unsigned int flags);
+asmlinkage long sys_fsconfig(int fd, unsigned int cmd, const char __user *key,
+			     const void __user *value, int aux);
+asmlinkage long sys_fsmount(int fs_fd, unsigned int flags,
+			    unsigned int ms_flags);
+asmlinkage long sys_fspick(int dfd, const char __user *path,
+			   unsigned int flags);
+
 /* fs/nfsctl.c */
 
 /* fs/open.c */
@@ -786,6 +806,9 @@ asmlinkage long sys_clone(unsigned long, unsigned long, int __user *,
 	       int __user *, unsigned long);
 #endif
 #endif
+
+asmlinkage long sys_clone3(struct clone_args __user *uargs, size_t size);
+
 asmlinkage long sys_execve(const char __user *filename,
 		const char __user *const __user *argv,
 		const char __user *const __user *envp);

@@ -2458,6 +2458,73 @@ SYSCALL_DEFINE5(clone, unsigned long, clone_flags, unsigned long, newsp,
 }
 #endif
 
+/*
+ * clone3 system call implementation (backported from Linux 5.3).
+ *
+ * Provides a extensible, struct-based interface to clone that supersedes the
+ * architecture-dependent clone() argument ordering.
+ */
+SYSCALL_DEFINE2(clone3, struct clone_args __user *, uargs, size_t, size)
+{
+	struct clone_args kargs;
+	int __user *parent_tidptr;
+	int __user *child_tidptr;
+	unsigned long clone_flags;
+	int err;
+
+	if (unlikely(size > PAGE_SIZE))
+		return -E2BIG;
+
+	if (unlikely(size < CLONE_ARGS_SIZE_VER0))
+		return -EINVAL;
+
+	err = copy_struct_from_user(&kargs, sizeof(kargs), uargs, size);
+	if (err)
+		return err;
+
+	/*
+	 * CLONE_PIDFD and CLONE_PARENT_SETTID are mutually exclusive
+	 * since they both use parent_tidptr.  This is also enforced in
+	 * copy_process(), but we check here to fail fast.
+	 */
+	if ((kargs.flags & (CLONE_PIDFD | CLONE_PARENT_SETTID)) ==
+			   (CLONE_PIDFD | CLONE_PARENT_SETTID))
+		return -EINVAL;
+
+	/*
+	 * If CLONE_DETACHED is specified make sure it matches the
+	 * CLONE_THREAD expectations.
+	 */
+	if ((kargs.flags & CLONE_DETACHED) && !(kargs.flags & CLONE_THREAD))
+		return -EINVAL;
+
+	/*
+	 * Validate exit_signal is a valid signal number or 0.
+	 */
+	if (kargs.exit_signal && !valid_signal(kargs.exit_signal))
+		return -EINVAL;
+
+	/*
+	 * The lower byte of clone_flags is reserved for the exit signal
+	 * via CSIGNAL.  In clone3, exit_signal is a separate field, so
+	 * there must be no signal bits embedded in flags.
+	 */
+	if (kargs.flags & CSIGNAL)
+		return -EINVAL;
+
+	clone_flags = kargs.flags | (kargs.exit_signal & CSIGNAL);
+
+	if (kargs.flags & CLONE_PIDFD)
+		parent_tidptr = (int __user *)(unsigned long)kargs.pidfd;
+	else
+		parent_tidptr = (int __user *)(unsigned long)kargs.parent_tid;
+
+	child_tidptr = (int __user *)(unsigned long)kargs.child_tid;
+
+	return _do_fork(clone_flags, kargs.stack, kargs.stack_size,
+			parent_tidptr, child_tidptr, kargs.tls);
+}
+
 void walk_process_tree(struct task_struct *top, proc_visitor visitor, void *data)
 {
 	struct task_struct *leader, *parent, *child;

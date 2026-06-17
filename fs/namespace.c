@@ -31,9 +31,15 @@
 #ifdef CONFIG_KSU_SUSFS_SUS_MOUNT
 #include <linux/susfs_def.h>
 #endif // #ifdef CONFIG_KSU_SUSFS_SUS_MOUNT
+#include <linux/anon_inodes.h>
+#include <linux/file.h>
+#include <uapi/linux/mount.h>
 
 #include "pnode.h"
 #include "internal.h"
+
+/* Defined in fsopen.c — used by open_tree() and move_mount() */
+extern const struct file_operations detached_mnt_fops;
 
 #ifdef CONFIG_KSU_SUSFS_SUS_MOUNT
 extern bool susfs_is_current_ksu_domain(void);
@@ -42,6 +48,8 @@ extern struct static_key_true susfs_is_sdcard_android_data_not_decrypted;
 #define CL_COPY_MNT_NS BIT(25) /* used by copy_mnt_ns() */
 
 #endif // #ifdef CONFIG_KSU_SUSFS_SUS_MOUNT
+/* File operations for detached mount fds, defined in fs/fsopen.c */
+extern const struct file_operations detached_mnt_fops;
 
 /* Maximum number of mounts in a mount namespace */
 unsigned int sysctl_mount_max __read_mostly = 100000;
@@ -3588,6 +3596,481 @@ out1:
 	path_put(&new);
 out0:
 	return error;
+}
+
+/*
+ * open_tree(2) - Open a mount subtree and optionally clone it.
+ *
+ * Returns a file descriptor referring to the mount.  If OPEN_TREE_CLONE
+ * is specified, the mount tree is cloned and detached; otherwise, the fd
+ * just references the existing mount.
+ */
+SYSCALL_DEFINE3(open_tree, int, dfd, const char __user *, filename,
+		unsigned int, flags)
+{
+	struct path path;
+	struct mount *mnt;
+	struct vfsmount *vfsmnt;
+	unsigned int lookup_flags = LOOKUP_AUTOMOUNT;
+	bool clone = flags & OPEN_TREE_CLONE;
+	int ret;
+	int o_flags;
+
+	if (!may_mount())
+		return -EPERM;
+
+	/* Only valid flags are OPEN_TREE_CLONE, OPEN_TREE_CLOEXEC,
+	 * AT_EMPTY_PATH, AT_RECURSIVE, and AT_SYMLINK_NOFOLLOW */
+	if (flags & ~(OPEN_TREE_CLONE | OPEN_TREE_CLOEXEC |
+		      AT_EMPTY_PATH | AT_RECURSIVE | AT_SYMLINK_NOFOLLOW))
+		return -EINVAL;
+
+	/* AT_RECURSIVE only makes sense with OPEN_TREE_CLONE */
+	if ((flags & AT_RECURSIVE) && !clone)
+		return -EINVAL;
+
+	if (!(flags & AT_SYMLINK_NOFOLLOW))
+		lookup_flags |= LOOKUP_FOLLOW;
+	if (flags & AT_EMPTY_PATH)
+		lookup_flags |= LOOKUP_EMPTY;
+
+	ret = user_path_at(dfd, filename, lookup_flags, &path);
+	if (ret)
+		return ret;
+
+	if (clone) {
+		int copy_flags = CL_PRIVATE;
+
+		namespace_lock();
+
+		if (IS_MNT_UNBINDABLE(real_mount(path.mnt))) {
+			namespace_unlock();
+			ret = -EINVAL;
+			goto out_path;
+		}
+
+		if (flags & AT_RECURSIVE)
+			mnt = copy_tree(real_mount(path.mnt), path.dentry,
+					copy_flags | CL_COPY_MNT_NS_FILE);
+		else
+			mnt = clone_mnt(real_mount(path.mnt), path.dentry,
+					copy_flags);
+
+		namespace_unlock();
+
+		if (IS_ERR(mnt)) {
+			ret = PTR_ERR(mnt);
+			goto out_path;
+		}
+		mnt->mnt.mnt_flags &= ~MNT_LOCKED;
+		vfsmnt = &mnt->mnt;
+	} else {
+		vfsmnt = mntget(path.mnt);
+	}
+
+	o_flags = O_RDWR;
+	if (flags & OPEN_TREE_CLOEXEC)
+		o_flags |= O_CLOEXEC;
+
+	ret = anon_inode_getfd("[mnt]", &detached_mnt_fops, vfsmnt, o_flags);
+	if (ret < 0)
+		mntput(vfsmnt);
+
+out_path:
+	path_put(&path);
+	return ret;
+}
+
+/*
+ * Retrieve a vfsmount from either a path or a detached mount fd.
+ *
+ * If from_dfd is a detached mount fd and *from_path is empty, get the
+ * mount from the fd's private_data.  Otherwise, resolve the path normally.
+ */
+static int get_mount_from_fd(int from_dfd, const char __user *from_path,
+			    unsigned int flags,
+			    struct path *src_path)
+{
+	unsigned int lookup_flags = 0;
+	int empty = 0;
+	int ret;
+
+	if (flags & MOVE_MOUNT_F_SYMLINKS)
+		lookup_flags |= LOOKUP_FOLLOW;
+	if (flags & MOVE_MOUNT_F_AUTOMOUNTS)
+		lookup_flags |= LOOKUP_AUTOMOUNT;
+	if (flags & MOVE_MOUNT_F_EMPTY_PATH)
+		lookup_flags |= LOOKUP_EMPTY;
+
+	ret = user_path_at_empty(from_dfd, from_path, lookup_flags,
+				 src_path, &empty);
+	if (ret)
+		return ret;
+
+	/* If the path was empty and the fd is a detached mount fd, use it */
+	if (empty && (flags & MOVE_MOUNT_F_EMPTY_PATH)) {
+		struct file *f;
+
+		f = fget(from_dfd);
+		if (!f) {
+			path_put(src_path);
+			return -EBADF;
+		}
+		if (f->f_op == &detached_mnt_fops) {
+			/*
+			 * Use the mount from the detached mount fd.
+			 * Drop the path we got from the empty lookup
+			 * and replace with the detached mount.
+			 */
+			path_put(src_path);
+			src_path->mnt = mntget(f->private_data);
+			src_path->dentry = dget(src_path->mnt->mnt_root);
+		}
+		fput(f);
+	}
+
+	return 0;
+}
+
+/*
+ * move_mount(2) - Move a mount from one place to another.
+ *
+ * This supports moving both mounted and detached mounts.  When used with
+ * open_tree(), allows attaching detached mount trees to the filesystem.
+ */
+SYSCALL_DEFINE5(move_mount,
+	int, from_dfd,
+	const char __user *, from_path,
+	int, to_dfd,
+	const char __user *, to_path,
+	unsigned int, ms_flags)
+{
+	struct path from, to, parent_path;
+	struct mount *src, *dest;
+	struct mount *p;
+	struct mountpoint *mp;
+	unsigned int to_lookup = 0;
+	int ret;
+
+	if (!may_mount())
+		return -EPERM;
+
+	if (ms_flags & ~MOVE_MOUNT__MASK)
+		return -EINVAL;
+
+	/* Resolve the source */
+	ret = get_mount_from_fd(from_dfd, from_path, ms_flags, &from);
+	if (ret)
+		return ret;
+
+	/* Resolve the destination */
+	if (ms_flags & MOVE_MOUNT_T_SYMLINKS)
+		to_lookup |= LOOKUP_FOLLOW;
+	if (ms_flags & MOVE_MOUNT_T_AUTOMOUNTS)
+		to_lookup |= LOOKUP_AUTOMOUNT;
+	if (ms_flags & MOVE_MOUNT_T_EMPTY_PATH)
+		to_lookup |= LOOKUP_EMPTY;
+
+	ret = user_path_at(to_dfd, to_path, to_lookup, &to);
+	if (ret)
+		goto out_from;
+
+	mp = lock_mount(&to);
+	ret = PTR_ERR(mp);
+	if (IS_ERR(mp))
+		goto out_to;
+
+	src = real_mount(from.mnt);
+	dest = real_mount(to.mnt);
+
+	/*
+	 * The destination must be in the current mount namespace.
+	 * If the source is detached (no parent / no namespace), that's
+	 * fine — we're attaching it.  If it's attached, both must be
+	 * in the current namespace.
+	 */
+	ret = -EINVAL;
+	if (!check_mnt(dest))
+		goto out_unlock;
+
+	if (from.dentry != from.mnt->mnt_root)
+		goto out_unlock;
+
+	if (d_is_dir(to.dentry) != d_is_dir(from.dentry))
+		goto out_unlock;
+
+	/*
+	 * If the source is a detached tree (not yet mounted), we
+	 * graft it directly.  Otherwise, this is a move operation.
+	 */
+	if (!mnt_has_parent(src)) {
+		/* Detached mount — graft it at the destination */
+		ret = graft_tree(src, dest, mp);
+	} else {
+		/* Attached mount — perform a move */
+		if (!check_mnt(src))
+			goto out_unlock;
+
+		if (src->mnt.mnt_flags & MNT_LOCKED) {
+			ret = -EINVAL;
+			goto out_unlock;
+		}
+
+		/* Don't move from a shared parent */
+		if (IS_MNT_SHARED(src->mnt_parent)) {
+			ret = -EINVAL;
+			goto out_unlock;
+		}
+
+		/* Don't create loops */
+		ret = -ELOOP;
+		for (p = dest; mnt_has_parent(p); p = p->mnt_parent)
+			if (p == src)
+				goto out_unlock;
+
+		/* Unbindable mounts cannot go under shared destinations */
+		if (IS_MNT_SHARED(dest) && tree_contains_unbindable(src)) {
+			ret = -EINVAL;
+			goto out_unlock;
+		}
+
+		ret = attach_recursive_mnt(src, dest, mp, &parent_path);
+		if (!ret)
+			list_del_init(&src->mnt_expire);
+	}
+
+out_unlock:
+	unlock_mount(mp);
+
+	if (!ret && mnt_has_parent(src))
+		path_put(&parent_path);
+
+out_to:
+	path_put(&to);
+out_from:
+	path_put(&from);
+	return ret;
+}
+
+/*
+ * Convert mount_attr flags to internal MNT_* flags.
+ */
+static int build_mount_flags(const struct mount_attr *attr, unsigned int *mnt_flags)
+{
+	unsigned int flags = 0;
+	unsigned int atime;
+
+	if (attr->attr_set & MOUNT_ATTR_RDONLY)
+		flags |= MNT_READONLY;
+	if (attr->attr_set & MOUNT_ATTR_NOSUID)
+		flags |= MNT_NOSUID;
+	if (attr->attr_set & MOUNT_ATTR_NODEV)
+		flags |= MNT_NODEV;
+	if (attr->attr_set & MOUNT_ATTR_NOEXEC)
+		flags |= MNT_NOEXEC;
+	if (attr->attr_set & MOUNT_ATTR_NODIRATIME)
+		flags |= MNT_NODIRATIME;
+
+	atime = attr->attr_set & MOUNT_ATTR__ATIME;
+	switch (atime) {
+	case MOUNT_ATTR_RELATIME:
+		flags |= MNT_RELATIME;
+		break;
+	case MOUNT_ATTR_NOATIME:
+		flags |= MNT_NOATIME;
+		break;
+	case MOUNT_ATTR_STRICTATIME:
+		/* strict is the default when nothing else is set */
+		break;
+	default:
+		if (atime)
+			return -EINVAL;
+		break;
+	}
+
+	*mnt_flags = flags;
+	return 0;
+}
+
+static int mount_setattr_prepare(struct mount_attr *attr)
+{
+	unsigned int allowed = MOUNT_ATTR_RDONLY | MOUNT_ATTR_NOSUID |
+			       MOUNT_ATTR_NODEV | MOUNT_ATTR_NOEXEC |
+			       MOUNT_ATTR__ATIME | MOUNT_ATTR_NODIRATIME |
+			       MOUNT_ATTR_NOSYMFOLLOW;
+
+	/* attr_set and attr_clr must not overlap */
+	if (attr->attr_set & attr->attr_clr)
+		return -EINVAL;
+
+	/* No unknown flags */
+	if (attr->attr_set & ~allowed)
+		return -EINVAL;
+	if (attr->attr_clr & ~allowed)
+		return -EINVAL;
+
+	/* NOSYMFOLLOW not supported on this kernel version */
+	if ((attr->attr_set | attr->attr_clr) & MOUNT_ATTR_NOSYMFOLLOW)
+		return -EINVAL;
+
+	/* ID-mapped mounts are not supported in this backport */
+	if (attr->userns_fd)
+		return -EINVAL;
+
+	/* Validate propagation if requested */
+	if (attr->propagation) {
+		if (attr->propagation & ~(unsigned long)(MS_SHARED | MS_PRIVATE |
+						    MS_SLAVE | MS_UNBINDABLE))
+			return -EINVAL;
+		if (!is_power_of_2(attr->propagation))
+			return -EINVAL;
+	}
+
+	/* Cannot set and clear atime flags simultaneously */
+	if ((attr->attr_set & MOUNT_ATTR__ATIME) &&
+	    (attr->attr_clr & MOUNT_ATTR__ATIME))
+		return -EINVAL;
+
+	return 0;
+}
+
+/*
+ * Apply attribute changes to a single mount.  Caller must hold
+ * mount_hash write lock.
+ */
+static int do_mount_setattr_one(struct mount *mnt,
+				const struct mount_attr *attr,
+				unsigned int new_flags)
+{
+	unsigned int mnt_flags;
+
+	mnt_flags = mnt->mnt.mnt_flags;
+
+	/* Clear requested bits */
+	if (attr->attr_clr & MOUNT_ATTR_RDONLY)
+		mnt_flags &= ~MNT_READONLY;
+	if (attr->attr_clr & MOUNT_ATTR_NOSUID)
+		mnt_flags &= ~MNT_NOSUID;
+	if (attr->attr_clr & MOUNT_ATTR_NODEV)
+		mnt_flags &= ~MNT_NODEV;
+	if (attr->attr_clr & MOUNT_ATTR_NOEXEC)
+		mnt_flags &= ~MNT_NOEXEC;
+	if (attr->attr_clr & MOUNT_ATTR_NODIRATIME)
+		mnt_flags &= ~MNT_NODIRATIME;
+	if (attr->attr_clr & MOUNT_ATTR__ATIME)
+		mnt_flags &= ~MNT_ATIME_MASK;
+
+	/* Set requested bits */
+	mnt_flags |= new_flags;
+
+	/* Check locked flags */
+	if (!can_change_locked_flags(mnt, mnt_flags))
+		return -EPERM;
+
+	mnt->mnt.mnt_flags = mnt_flags;
+	touch_mnt_namespace(mnt->mnt_ns);
+	return 0;
+}
+
+/*
+ * mount_setattr(2) - Change mount attributes.
+ *
+ * Sets or clears mount flags (RDONLY, NOSUID, NODEV, NOEXEC, atime
+ * modes) and optionally changes mount propagation type.  Can operate
+ * recursively on the entire subtree if AT_RECURSIVE is specified.
+ */
+SYSCALL_DEFINE5(mount_setattr,
+	int, dfd,
+	const char __user *, path,
+	unsigned int, flags,
+	struct mount_attr __user *, uattr,
+	size_t, usize)
+{
+	struct mount_attr attr = {};
+	struct path target;
+	struct mount *mnt, *m;
+	unsigned int new_flags;
+	unsigned int lookup_flags = LOOKUP_AUTOMOUNT;
+	int ret;
+
+	if (!may_mount())
+		return -EPERM;
+
+	if (flags & ~AT_RECURSIVE)
+		return -EINVAL;
+
+	if (usize < MOUNT_ATTR_SIZE_VER0)
+		return -EINVAL;
+	if (usize > sizeof(attr))
+		return -E2BIG;
+
+	if (copy_from_user(&attr, uattr, usize))
+		return -EFAULT;
+
+	ret = mount_setattr_prepare(&attr);
+	if (ret)
+		return ret;
+
+	ret = build_mount_flags(&attr, &new_flags);
+	if (ret)
+		return ret;
+
+	ret = user_path_at(dfd, path, lookup_flags, &target);
+	if (ret)
+		return ret;
+
+	mnt = real_mount(target.mnt);
+
+	ret = -EINVAL;
+	if (target.dentry != target.mnt->mnt_root)
+		goto out;
+
+	/* Handle propagation change if requested */
+	if (attr.propagation) {
+		int ms_flags = attr.propagation;
+
+		if (flags & AT_RECURSIVE)
+			ms_flags |= MS_REC;
+
+		/* do_change_type handles its own locking */
+		ret = do_change_type(&target, ms_flags);
+		if (ret)
+			goto out;
+
+		/* If only propagation was requested, we're done */
+		if (!attr.attr_set && !attr.attr_clr)
+			goto out_ok;
+	}
+
+	/* Apply attribute changes under proper locking */
+	namespace_lock();
+
+	ret = -EINVAL;
+	if (!check_mnt(mnt)) {
+		namespace_unlock();
+		goto out;
+	}
+
+	lock_mount_hash();
+	if (flags & AT_RECURSIVE) {
+		for (m = mnt; m; m = next_mnt(m, mnt)) {
+			ret = do_mount_setattr_one(m, &attr, new_flags);
+			if (ret)
+				break;
+		}
+	} else {
+		ret = do_mount_setattr_one(mnt, &attr, new_flags);
+	}
+	unlock_mount_hash();
+
+	namespace_unlock();
+
+out_ok:
+	if (!ret)
+		ret = 0;
+out:
+	path_put(&target);
+	return ret;
 }
 
 static void __init init_mount_tree(void)
