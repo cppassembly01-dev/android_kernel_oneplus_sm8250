@@ -1154,7 +1154,7 @@ struct vfsmount *vfs_kern_mount(struct file_system_type *type,
 	//   for the sake of performance
 	if (static_branch_unlikely(&susfs_is_sdcard_android_data_not_decrypted)) {
 		if (susfs_is_current_ksu_domain()) {
-			mnt = susfs_alloc_non_unshare_ksu_vfsmnt(name ?:"none");
+			mnt = &susfs_alloc_non_unshare_ksu_vfsmnt(name ?:"none")->mnt;
 			goto bypass_orig_flow;
 		}
 	}
