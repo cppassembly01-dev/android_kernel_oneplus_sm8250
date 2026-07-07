@@ -238,7 +238,8 @@ void thermal_cdev_update(struct thermal_cooling_device *cdev)
 			instance->tz->id, instance->target);
 		if (instance->target == THERMAL_NO_TARGET)
 			continue;
-		if (instance->tz->governor->min_state_throttle) {
+		if (instance->tz->governor &&
+		    instance->tz->governor->min_state_throttle) {
 			if (instance->target < min_target)
 				min_target = instance->target;
 		} else {
