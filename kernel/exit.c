@@ -1631,6 +1631,7 @@ static long kernel_waitid(int which, pid_t upid, struct waitid_info *infop,
 	struct pid *pid = NULL;
 	enum pid_type type;
 	long ret;
+	struct fd f = {NULL, 0};
 
 	if (options & ~(WNOHANG|WNOWAIT|WEXITED|WSTOPPED|WCONTINUED|
 			__WNOTHREAD|__WCLONE|__WALL))
@@ -1652,11 +1653,34 @@ static long kernel_waitid(int which, pid_t upid, struct waitid_info *infop,
 		if (upid <= 0)
 			return -EINVAL;
 		break;
+	case P_PIDFD: {
+		struct file *file;
+
+		type = PIDTYPE_PID;
+
+		f = fdget(upid);
+		if (!f.file)
+			return -EBADF;
+
+		file = f.file;
+
+		/* Check if it's a pidfd */
+		pid = tgid_pidfd_to_pid(file);
+		if (IS_ERR(pid)) {
+			fdput(f);
+			return PTR_ERR(pid);
+		}
+
+		/* Get a reference so put_pid below is safe */
+		get_pid(pid);
+		fdput(f);
+		break;
+	}
 	default:
 		return -EINVAL;
 	}
 
-	if (type < PIDTYPE_MAX)
+	if (type < PIDTYPE_MAX && which != P_PIDFD)
 		pid = find_get_pid(upid);
 
 	wo.wo_type	= type;
