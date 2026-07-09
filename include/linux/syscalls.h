@@ -408,6 +408,9 @@ asmlinkage long sys_mount_setattr(int dfd, const char __user *path,
 				  unsigned int flags,
 				  struct mount_attr __user *uattr,
 				  size_t usize);
+asmlinkage long sys_openat2(int dfd, const char __user *filename,
+			    struct open_how __user *how, size_t usize);
+asmlinkage long sys_pidfd_getfd(int pidfd, int fd, unsigned int flags);
 
 /* fs/fsopen.c - new mount API (backported from 5.2) */
 asmlinkage long sys_fsopen(const char __user *fs_name, unsigned int flags);

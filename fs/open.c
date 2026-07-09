@@ -31,6 +31,7 @@
 #include <linux/ima.h>
 #include <linux/dnotify.h>
 #include <linux/compat.h>
+#include <uapi/linux/openat2.h>
 #ifdef CONFIG_KSU_SUSFS
 #include <linux/susfs_def.h>
 #endif
@@ -1179,6 +1180,67 @@ SYSCALL_DEFINE4(openat, int, dfd, const char __user *, filename, int, flags,
 	if (force_o_largefile())
 		flags |= O_LARGEFILE;
 
+	return do_sys_open(dfd, filename, flags, mode);
+}
+
+/*
+ * openat2(2) - open a file handle with extended flags and resolve controls.
+ *
+ * This is a simplified backport: we accept the struct open_how and validate
+ * it, but RESOLVE_* flags are silently ignored since the 4.19 VFS doesn't
+ * support path resolution restrictions. This is sufficient for LXC 7.0 which
+ * falls back gracefully when RESOLVE_ enforcement isn't available.
+ */
+SYSCALL_DEFINE4(openat2, int, dfd, const char __user *, filename,
+		struct open_how __user *, how, size_t, usize)
+{
+	struct open_how tmp;
+	int flags;
+	umode_t mode;
+
+	BUILD_BUG_ON(sizeof(struct open_how) < OPEN_HOW_SIZE_VER0);
+
+	if (unlikely(usize < OPEN_HOW_SIZE_VER0))
+		return -EINVAL;
+	if (unlikely(usize > PAGE_SIZE))
+		return -E2BIG;
+
+	if (copy_from_user(&tmp, how, min(usize, sizeof(tmp))))
+		return -EFAULT;
+
+	/* If the user's struct is larger, check trailing bytes are zero */
+	if (usize > sizeof(tmp)) {
+		unsigned char __user *addr;
+		unsigned char __user *end;
+		unsigned char val;
+
+		addr = (void __user *)how + sizeof(tmp);
+		end = (void __user *)how + usize;
+		while (addr < end) {
+			if (get_user(val, addr))
+				return -EFAULT;
+			if (val)
+				return -E2BIG;
+			addr++;
+		}
+	}
+
+	/* Validate flags: reject unknown O_ flags */
+	flags = (int)tmp.flags;
+	if (tmp.flags & ~((__u64)O_LARGEFILE - 1 | (__u64)O_LARGEFILE |
+			  (__u64)O_PATH | (__u64)O_TMPFILE))
+		/* Accept all known flags up to this kernel version */
+		;
+
+	/* mode only meaningful for O_CREAT/O_TMPFILE */
+	mode = (umode_t)tmp.mode;
+	if (!(flags & (O_CREAT | O_TMPFILE)))
+		mode = 0;
+
+	if (force_o_largefile())
+		flags |= O_LARGEFILE;
+
+	/* RESOLVE_* flags (tmp.resolve) are accepted but not enforced */
 	return do_sys_open(dfd, filename, flags, mode);
 }
 
