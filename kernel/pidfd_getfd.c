@@ -76,7 +76,11 @@ SYSCALL_DEFINE3(pidfd_getfd, int, pidfd, int, fd, unsigned int, flags)
 	if (!f.file)
 		return -EBADF;
 
-	pid = tgid_pidfd_to_pid(f.file);
+	/* Check anon_inode pidfds first (from clone3/pidfd_open) */
+	if (f.file->f_op == &pidfd_fops)
+		pid = f.file->private_data;
+	else
+		pid = tgid_pidfd_to_pid(f.file);
 	if (IS_ERR(pid)) {
 		ret = PTR_ERR(pid);
 		goto out_fdput;

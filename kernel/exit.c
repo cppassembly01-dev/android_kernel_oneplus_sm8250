@@ -1664,8 +1664,12 @@ static long kernel_waitid(int which, pid_t upid, struct waitid_info *infop,
 
 		file = f.file;
 
-		/* Check if it's a pidfd */
-		pid = tgid_pidfd_to_pid(file);
+		/* Check anon_inode pidfds first (from clone3/pidfd_open) */
+		if (file->f_op == &pidfd_fops)
+			pid = file->private_data;
+		else
+			pid = tgid_pidfd_to_pid(file);
+
 		if (IS_ERR(pid)) {
 			fdput(f);
 			return PTR_ERR(pid);
