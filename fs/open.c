@@ -1191,12 +1191,19 @@ SYSCALL_DEFINE4(openat, int, dfd, const char __user *, filename, int, flags,
  * support path resolution restrictions. This is sufficient for LXC 7.0 which
  * falls back gracefully when RESOLVE_ enforcement isn't available.
  */
+/* From fs/fsopen.c — check if an fd is a detached mount fd */
+extern struct vfsmount *lookup_detached_mnt(struct file *file);
+
 SYSCALL_DEFINE4(openat2, int, dfd, const char __user *, filename,
 		struct open_how __user *, how, size_t, usize)
 {
 	struct open_how tmp;
 	int flags;
 	umode_t mode;
+	long ret;
+	int real_dfd = dfd;
+	struct file *dfd_file = NULL;
+	struct vfsmount *detached_mnt = NULL;
 
 	BUILD_BUG_ON(sizeof(struct open_how) < OPEN_HOW_SIZE_VER0);
 
@@ -1240,8 +1247,47 @@ SYSCALL_DEFINE4(openat2, int, dfd, const char __user *, filename,
 	if (force_o_largefile())
 		flags |= O_LARGEFILE;
 
+	/*
+	 * If dfd is a detached mount fd (from fsmount), we can't use it
+	 * directly as a directory fd because anon_inode fds aren't
+	 * directories. Instead, open an O_PATH fd to the mount root
+	 * and use that as the dfd.
+	 */
+	if (dfd >= 0) {
+		dfd_file = fget(dfd);
+		if (dfd_file) {
+			detached_mnt = lookup_detached_mnt(dfd_file);
+			if (detached_mnt) {
+				struct path mnt_root = {
+					.mnt = detached_mnt,
+					.dentry = detached_mnt->mnt_root
+				};
+				int tmp_fd = get_unused_fd_flags(O_CLOEXEC);
+				if (tmp_fd >= 0) {
+					struct file *path_file;
+					path_file = dentry_open(&mnt_root,
+						O_PATH | O_DIRECTORY, current_cred());
+					if (!IS_ERR(path_file)) {
+						fd_install(tmp_fd, path_file);
+						real_dfd = tmp_fd;
+					} else {
+						put_unused_fd(tmp_fd);
+					}
+				}
+				mntput(detached_mnt);
+			}
+			fput(dfd_file);
+		}
+	}
+
 	/* RESOLVE_* flags (tmp.resolve) are accepted but not enforced */
-	return do_sys_open(dfd, filename, flags, mode);
+	ret = do_sys_open(real_dfd, filename, flags, mode);
+
+	/* Close the temporary O_PATH fd if we created one */
+	if (real_dfd != dfd && real_dfd >= 0)
+		ksys_close(real_dfd);
+
+	return ret;
 }
 
 #ifdef CONFIG_COMPAT

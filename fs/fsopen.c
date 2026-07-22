@@ -67,28 +67,12 @@ struct vfsmount *lookup_detached_mnt(struct file *file)
 {
 	struct vfsmount *mnt;
 
-	/* Legacy anon_inode path (from open_tree with OPEN_TREE_CLONE) */
-	if (file->f_op == &detached_mnt_fops) {
-		mnt = file->private_data;
-		if (mnt)
-			mntget(mnt);
-		return mnt;
-	}
-
-	/*
-	 * O_PATH fd from fsmount(): the mount root is stored in
-	 * file->f_path. Check it's a detached mount (not yet in a
-	 * mount namespace) by verifying it's the mount root.
-	 */
-	if (file->f_flags & O_PATH) {
-		mnt = file->f_path.mnt;
-		if (mnt && file->f_path.dentry == mnt->mnt_root) {
-			mntget(mnt);
-			return mnt;
-		}
-	}
-
-	return NULL;
+	if (file->f_op != &detached_mnt_fops)
+		return NULL;
+	mnt = file->private_data;
+	if (mnt)
+		mntget(mnt);
+	return mnt;
 }
 EXPORT_SYMBOL(lookup_detached_mnt);
 
@@ -374,9 +358,8 @@ SYSCALL_DEFINE3(fsmount, int, fs_fd, unsigned int, flags, unsigned int, ms_flags
 	struct fs_context *fc;
 	struct vfsmount *mnt;
 	struct fd f;
-	struct file *file;
 	unsigned int mnt_flags;
-	int fd, o_flags;
+	int fd;
 
 	if (!ns_capable(current->nsproxy->mnt_ns->user_ns, CAP_SYS_ADMIN))
 		return -EPERM;
@@ -416,33 +399,11 @@ SYSCALL_DEFINE3(fsmount, int, fs_fd, unsigned int, flags, unsigned int, ms_flags
 
 	mnt->mnt_flags |= mnt_flags;
 
-	/*
-	 * Create an O_PATH fd referencing the mount root. This allows
-	 * openat2(fd, "relative/path") to work, unlike anon_inode fds.
-	 */
-	o_flags = O_PATH;
-	if (flags & FSMOUNT_CLOEXEC)
-		o_flags |= O_CLOEXEC;
-
-	fd = get_unused_fd_flags(o_flags);
-	if (fd < 0) {
+	fd = anon_inode_getfd("[detached_mount]", &detached_mnt_fops, mnt,
+			      flags & FSMOUNT_CLOEXEC ? O_CLOEXEC : 0);
+	if (fd < 0)
 		mntput(mnt);
-		fdput(f);
-		return fd;
-	}
 
-	{
-		struct path path = { .mnt = mnt, .dentry = mnt->mnt_root };
-		file = dentry_open(&path, o_flags, current_cred());
-	}
-	if (IS_ERR(file)) {
-		put_unused_fd(fd);
-		mntput(mnt);
-		fdput(f);
-		return PTR_ERR(file);
-	}
-
-	fd_install(fd, file);
 	fdput(f);
 	return fd;
 }
