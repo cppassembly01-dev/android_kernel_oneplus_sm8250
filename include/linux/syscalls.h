@@ -411,6 +411,13 @@ asmlinkage long sys_mount_setattr(int dfd, const char __user *path,
 asmlinkage long sys_openat2(int dfd, const char __user *filename,
 			    struct open_how __user *how, size_t usize);
 asmlinkage long sys_pidfd_getfd(int pidfd, int fd, unsigned int flags);
+asmlinkage long sys_landlock_create_ruleset(
+		const struct landlock_ruleset_attr __user *attr,
+		size_t size, __u32 flags);
+asmlinkage long sys_landlock_add_rule(int ruleset_fd,
+		enum landlock_rule_type rule_type,
+		const void __user *rule_attr, __u32 flags);
+asmlinkage long sys_landlock_restrict_self(int ruleset_fd, __u32 flags);
 
 /* fs/fsopen.c - new mount API (backported from 5.2) */
 asmlinkage long sys_fsopen(const char __user *fs_name, unsigned int flags);
